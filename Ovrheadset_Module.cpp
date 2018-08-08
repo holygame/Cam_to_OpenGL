@@ -13,23 +13,32 @@
 #include <yarp/sig/all.h>
 #include <yarp/dev/IJoypadController.h>
 #include <OVR_CAPI.h>
+#include <OVR_CAPI_GL.h>
+#include <thread>
 
 
 using namespace yarp::os;
 using namespace yarp::dev;
 using namespace yarp::sig;
-using std::cout;
-using std::endl;
+
+#define LOG(x) std::cerr << x << std::endl;
 
 
+//-----------------//
 int window_width;
 int window_height;
+IFrameGrabberImage *IframL;
+IFrameGrabberImage *IframR;
+GLFWwindow* window;
+ovrTextureSwapChain textureSwapChain;
+GLuint texId;
+ovrSession session;
+ovrGraphicsLuid luid;
+//------------------//
 
-
-
-
-
-static GLuint matToTexture(const cv::Mat &mat, GLenum minFilter, GLenum magFilter, GLenum wrapFilter);
+void Playback();
+static GLuint matToTexture(const cv::Mat &mat, GLenum minFilter, GLenum magFilter, GLenum
+	wrapFilter);
 void error_callback(int error, const char* description);
 void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods);
 void resize_callback(GLFWwindow* window, int new_width, int new_height);
@@ -38,24 +47,61 @@ void init_opengl(int w, int h);
 cv::Mat ShowCamera(IFrameGrabberImage** Ifram, bool debug = true);
 void OpenView(const std::string& local, const std::string& remote, PolyDriver& cam, IFrameGrabberImage** Ifram);
 
+
 int main(int argc, char **argv)
 {
 
 	Network yarp;
-	Property driverOpt;
-	IFrameGrabberImage *IframL;
-	IFrameGrabberImage *IframR;
 	PolyDriver camL;
 	PolyDriver camR;
 	OpenView("/local/cam/left", "/icubSim/cam/left", camL, &IframL);
-	OpenView("/local/cam/right", "/icubSim/cam/right", camR, &IframR);
-	cv::Mat img = ShowCamera(&IframL);
-	window_width = img.cols;
-	window_height = img.rows;
+	OpenView("/local/cam/right", "/icubSim/cam", camR, &IframR);
+	//cv::Mat img = ShowCamera(&IframL);
+	//window_width = img.cols;
+	//window_height = img.rows;
+
+
+
+	//  ------ OVR SETUP --------
+	ovrResult result = ovr_Initialize(nullptr);
+
+	if (OVR_FAILURE(result))
+		return 0;
+
+	result = ovr_Create(&session, &luid);
+	if (!OVR_SUCCESS(result)) {
+		LOG("Oculus Rift not detected");
+		std::exit(-1);
+	}
+
+	ovr_SetTrackingOriginType(session, ovrTrackingOrigin_EyeLevel);
+
+	ovrHmdDesc hmdDesc = ovr_GetHmdDesc(session);
+	if (hmdDesc.ProductName[0] == '\0') {
+		LOG("Rift detected, display not enabled");
+	}
+
+	ovrSizei windowSize = hmdDesc.Resolution;
+	ovrFovPort recommendedFov0Data = hmdDesc.DefaultEyeFov[0];
+	ovrFovPort recommendedFov1Data = hmdDesc.DefaultEyeFov[1];
+	ovrSizei bufferSize;
+	bufferSize.w = 4000;
+	bufferSize.h = 2000;
+	textureSwapChain = 0;
+	ovrTextureSwapChainDesc desc = {};
+	desc.Type = ovrTexture_2D;
+	desc.ArraySize = 1;
+	desc.Format = OVR_FORMAT_R8G8B8A8_UNORM_SRGB;
+	desc.Width = bufferSize.w;
+	desc.Height = bufferSize.h;
+	desc.MipLevels = 1;
+	desc.SampleCount = 1;
+	desc.StaticImage = ovrFalse;
+
 
 	//---- SETUP GLFW ----------//
-	GLFWwindow* window;
-
+	
+	GLFWwindow* windowL;
 	glfwSetErrorCallback(error_callback);
 
 	if (!glfwInit()) {
@@ -64,8 +110,11 @@ int main(int argc, char **argv)
 
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
-	window = glfwCreateWindow(window_width, window_height, "Simple example", NULL, NULL);
+	window_width = windowSize.w/2;
+	window_height = windowSize.h/2;
+	window = glfwCreateWindow(window_width, window_height, "Yarp Oculus", nullptr, nullptr);
 	if (!window) {
+		LOG("Could not create Window");
 		glfwTerminate();
 
 	}
@@ -77,52 +126,38 @@ int main(int argc, char **argv)
 
 	glfwSwapInterval(1);
 
+	
+	
+
 	// ---- SETUP GLEW ---- //
 	GLenum err = glewInit();
 	if (GLEW_OK != err)
 	{
-		cout << "GLEW initialisation error: " << glewGetErrorString(err) << endl;
+		std::cerr << "GLEW initialisation error: " << glewGetErrorString(err) << std::endl;
 		return -1;
 	}
-	cout << "GLEW okay - using version: " << glewGetString(GLEW_VERSION) << endl;
-	//  ------ OVR SETUP --------
-	ovrResult result = ovr_Initialize(nullptr);
-
-	if (OVR_FAILURE(result))
-		return 0;
-
-	ovrSession session;
-	ovrGraphicsLuid luid;
-	result = ovr_Create(&session, &luid);
-	if (!OVR_SUCCESS(result)) {
-		std::cerr << "Oculus Rift not detected" << std::endl;
-		std::exit(-1);
-	}
-
-	ovr_SetTrackingOriginType(session, ovrTrackingOrigin_EyeLevel);
-
-	ovrHmdDesc desc = ovr_GetHmdDesc(session);
-	if (desc.ProductName[0] == '\0') {
-		std::cerr << "Rift detected, display not enabled" << std::endl;
-	}
-
-	ovrSizei resolution = desc.Resolution;
-
+	std::cout << "GLEW okay - using version: " << glewGetString(GLEW_VERSION) << std::endl;
 
 	// --- Open window --- ///
 	init_opengl(window_width, window_height);
 
 	// --- drawing img ---- //
-	while (!glfwWindowShouldClose(window)) {
+	LOG("started generating images");
+	while (!glfwWindowShouldClose(window)) 
+	{
+		if (ovr_CreateTextureSwapChainGL(session, &desc, &textureSwapChain) == ovrSuccess)
+		{
+			cv::Mat imgL = ShowCamera(&IframL);
+			cv::Mat imgR = ShowCamera(&IframR);
+			draw_frame(imgL);
+			draw_frame(imgR);
+			glfwSwapBuffers(window);
+			glfwPollEvents();
 
-		cv::Mat imgL = ShowCamera(&IframL);
-		cv::Mat imgR = ShowCamera(&IframR);
-		draw_frame(imgL);
-		draw_frame(imgR);
-		glfwSwapBuffers(window);
-		glfwPollEvents();
-
+		}
 	}
+	LOG("Process finished press Enter to leave");
+	std::cin.get();
 	glfwDestroyWindow(window);
 	glfwTerminate();
 
@@ -134,13 +169,15 @@ int main(int argc, char **argv)
 
 
 // Function turn a cv::Mat into a texture, and return the texture ID as a GLuint for use
-static GLuint matToTexture(const cv::Mat &mat, GLenum minFilter, GLenum magFilter, GLenum wrapFilter) {
+static GLuint matToTexture(const cv::Mat &mat, GLenum minFilter, GLenum magFilter, GLenum wrapFilter) 
+{
 	// Generate a number for our textureID's unique handle
-	GLuint textureID;
-	glGenTextures(1, &textureID);
+	GLuint texId;
+	//glGenTextures(1, &texId);
 
+	ovr_GetTextureSwapChainBufferGL(session, textureSwapChain, 0, &texId);
 	// Bind to our texture handle
-	glBindTexture(GL_TEXTURE_2D, textureID);
+	glBindTexture(GL_TEXTURE_2D, texId);
 
 	// Catch silly-mistake texture interpolation method for magnification
 	if (magFilter == GL_LINEAR_MIPMAP_LINEAR ||
@@ -148,7 +185,7 @@ static GLuint matToTexture(const cv::Mat &mat, GLenum minFilter, GLenum magFilte
 		magFilter == GL_NEAREST_MIPMAP_LINEAR ||
 		magFilter == GL_NEAREST_MIPMAP_NEAREST)
 	{
-		cout << "You can't use MIPMAPs for magnification - setting filter to GL_LINEAR" << endl;
+		std::cout << "You can't use MIPMAPs for magnification - setting filter to GL_LINEAR" << std::endl;
 		magFilter = GL_LINEAR;
 	}
 
@@ -188,7 +225,7 @@ static GLuint matToTexture(const cv::Mat &mat, GLenum minFilter, GLenum magFilte
 		glGenerateMipmap(GL_TEXTURE_2D);
 	}
 
-	return textureID;
+	return texId;
 }
 
 void error_callback(int error, const char* description) {
@@ -215,6 +252,7 @@ void draw_frame(const cv::Mat& frame) {
 	glMatrixMode(GL_MODELVIEW);     // Operate on model-view matrix
 
 	glEnable(GL_TEXTURE_2D);
+	//glEnable(GL_FRAMEBUFFER_SRGB)
 	GLuint image_tex = matToTexture(frame, GL_LINEAR_MIPMAP_LINEAR, GL_LINEAR, GL_CLAMP);
 
 	/* Draw a quad */
@@ -283,7 +321,23 @@ void OpenView(const std::string& local, const std::string& remote, PolyDriver& c
 		std::exit(1);
 	}
 }
+void Playback()
+{
+	using namespace std::literals::chrono_literals;
 
+	LOG("started generating images");
+	while (!glfwWindowShouldClose(window)) {
+
+		cv::Mat imgL = ShowCamera(&IframL);
+		cv::Mat imgR = ShowCamera(&IframR);
+		draw_frame(imgL);
+		draw_frame(imgR);
+		glfwSwapBuffers(window);
+		glfwPollEvents();
+		std::this_thread::sleep_for(5ms);
+
+	}
+}
 
 
 //void initTexture(IplImage** Image)
